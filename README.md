@@ -3,14 +3,20 @@
 A powerful and efficient Go tool to fetch and save search results from FOFA (Cyberspace Search Engine) with real-time data saving, concurrent requests, and rate limiting support.
 
 ## Features
-
 ✨ **Interactive Query Input** - Enter your FOFA query directly when running the tool
+
 🚀 **Concurrent Requests** - Configurable concurrent fetching for faster results
+
 ⏱️ **Rate Limiting** - Customizable delay between requests to avoid API rate limits
+
 💾 **Real-time Saving** - Data is saved immediately as it's fetched (no data loss if interrupted)
+
 📁 **Multiple Output Formats** - Domain list, JSON, CSV, and summary files
+
 🔧 **Browser-like Headers** - Mimics real browser requests to avoid blocking
+
 📊 **Progress Tracking** - Real-time progress display with percentage completion
+
 🗂️ **Organized Output** - All results saved in timestamped files within `results/` folder
 
 ## Prerequisites
