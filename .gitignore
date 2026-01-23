@@ -1,0 +1,3 @@
+#IGNORE FILE and FOLDERS
+.env
+results/
