@@ -16,6 +16,65 @@ import (
 	"time"
 )
 
+var (
+	Green  = "\033[92m"
+	Red    = "\033[91m"
+	Yellow = "\033[93m"
+	Cyan   = "\033[36m"
+	White  = "\033[97m"
+	Reset  = "\033[0m"
+	Bold   = "\033[1m"
+)
+
+type StickyBar struct {
+	total    int
+	current  int
+	barWidth int
+	size     int
+	mu       sync.Mutex
+}
+
+func newStickyBar(total, size int) *StickyBar {
+	return &StickyBar{total: total, barWidth: 50, size: size}
+}
+
+func (b *StickyBar) render() {
+	pct := 0.0
+	filled := 0
+	if b.total > 0 {
+		pct = float64(b.current) / float64(b.total) * 100
+		filled = int(float64(b.barWidth) * float64(b.current) / float64(b.total))
+	}
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", b.barWidth-filled)
+	fmt.Printf("\r\033[K%s FoFa API Grabber v1.1 by @willygoid | Total Size: %d %s\n",
+		Cyan+Bold, b.size, Reset)
+	fmt.Printf("\r\033[K%s[%s] %d/%d (%.0f%%)%s",
+		White+Bold, bar, b.current, b.total, pct, Reset)
+}
+
+func (b *StickyBar) Init() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.render()
+}
+
+func (b *StickyBar) Increment(result string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	fmt.Printf("\033[1A\r\033[K%s\n", result)
+	b.current++
+	b.render()
+}
+
+func (b *StickyBar) Finish() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.current = b.total
+	fmt.Printf("\033[1A\r\033[K")
+	b.render()
+	fmt.Println()
+}
+
 func PrintBanner() {
 	banner := `
  _   _             _____           _     
@@ -24,7 +83,7 @@ func PrintBanner() {
 |  _  \ \/ / '__|   | |/ _ \ / _ \| / __|
 | | | |>  <| |      | | (_) | (_) | \__ \
 \_| |_/_/\_\_|      \_/\___/ \___/|_|___/
-		   FoFa API Grabber v1.0
+		   FoFa API Grabber v1.1
 		   by @willygoid
 `
 	fmt.Println(banner)
@@ -100,7 +159,6 @@ func main() {
 
 	fmt.Printf("\nConfiguration loaded:\n")
 	fmt.Printf("- Delay: %v\n", delayBetweenRequests)
-	fmt.Printf("- Concurrent requests: %d\n", config.ConcurrentRequests)
 	fmt.Printf("- Results will be saved to: results/\n\n")
 
 	// Step 1: Get first page to determine total size
@@ -122,16 +180,8 @@ func main() {
 	fmt.Printf("Total pages to fetch: %d\n", totalPages)
 	fmt.Printf("Query: %s\n\n", firstPage.Query)
 
-	// Step 2: Fetch all pages
+	// Step 2: Fetch all pages sequentially — FOFA requires ordered pagination (error 820013)
 	allResults := make([][]string, 0)
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-
-	// Channel untuk mengontrol concurrency
-	semaphore := make(chan struct{}, config.ConcurrentRequests)
-
-	// Progress tracking
-	completed := 0
 
 	// File paths for real-time saving
 	domainFile := fmt.Sprintf("results/fofa_domain_%s.txt", timestamp)
@@ -143,55 +193,57 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("Starting to fetch %d pages with %d concurrent requests and %v delay...\n\n",
-		totalPages, config.ConcurrentRequests, delayBetweenRequests)
+	fmt.Printf("Starting to fetch %d pages sequentially with %v delay...\n\n",
+		totalPages, delayBetweenRequests)
 
+	bar := newStickyBar(totalPages, totalSize)
+	bar.Init()
+
+	const maxRetries = 3
 	for page := 1; page <= totalPages; page++ {
-		wg.Add(1)
-		go func(p int) {
-			defer wg.Done()
-			semaphore <- struct{}{}        // Acquire
-			defer func() { <-semaphore }() // Release
+		apiURL := fmt.Sprintf("https://fofa.info/api/v1/search/all?key=%s&page=%d&qbase64=%s",
+			config.APIKey, page, queryBase64)
 
-			apiURL := fmt.Sprintf("https://fofa.info/api/v1/search/all?key=%s&page=%d&qbase64=%s",
-				config.APIKey, p, queryBase64)
-
-			data, err := fetchFofaData(apiURL, delayBetweenRequests)
-			if err != nil {
-				fmt.Printf("❌ Error fetching page %d: %v\n", p, err)
-				return
+		var data *FofaResponse
+		var fetchErr error
+		var attempts int
+		for attempt := 1; attempt <= maxRetries; attempt++ {
+			attempts = attempt
+			data, fetchErr = fetchFofaData(apiURL, delayBetweenRequests)
+			if fetchErr == nil {
+				break
 			}
-
-			// Save immediately to files (with mutex for thread safety)
-			mu.Lock()
-
-			// Append domains
-			if err := appendDomains(data.Results, domainFile); err != nil {
-				fmt.Printf("⚠ Warning: failed to save domains from page %d: %v\n", p, err)
+			if attempt < maxRetries {
+				time.Sleep(delayBetweenRequests * 2)
 			}
+		}
+		if fetchErr != nil {
+			bar.Increment(fmt.Sprintf("%s❌ Page %d skipped after %d attempts: %v%s",
+				Red, page, maxRetries, fetchErr, Reset))
+			continue
+		}
 
-			// Append to CSV
-			if err := appendToCSV(data.Results, csvFile); err != nil {
-				fmt.Printf("⚠ Warning: failed to save CSV from page %d: %v\n", p, err)
-			}
+		if err := appendDomains(data.Results, domainFile); err != nil {
+			bar.Increment(fmt.Sprintf("%s⚠ Page %d: failed to save domains: %v%s",
+				Yellow, page, err, Reset))
+		}
+		if err := appendToCSV(data.Results, csvFile); err != nil {
+			bar.Increment(fmt.Sprintf("%s⚠ Page %d: failed to save CSV: %v%s",
+				Yellow, page, err, Reset))
+		}
 
-			allResults = append(allResults, data.Results...)
-			completed++
-			fmt.Printf("✓ Progress: %d/%d pages completed (%.1f%%) - %d results saved\n",
-				completed, totalPages, float64(completed)/float64(totalPages)*100, len(data.Results))
-
-			mu.Unlock()
-
-			// Delay to avoid rate limiting
-			time.Sleep(delayBetweenRequests)
-		}(page)
+		allResults = append(allResults, data.Results...)
+		retryNote := ""
+		if attempts > 1 {
+			retryNote = fmt.Sprintf(" (retry x%d)", attempts-1)
+		}
+		bar.Increment(fmt.Sprintf("%s✓ Page %d/%d — %d results%s%s",
+			Green, page, totalPages, len(data.Results), retryNote, Reset))
 	}
 
-	// Wait for all goroutines to complete
-	wg.Wait()
+	bar.Finish()
 
-	fmt.Printf("\n✓ All pages fetched successfully!\n")
-	fmt.Printf("Total results collected: %d\n\n", len(allResults))
+	fmt.Printf("\n%s✓ All pages fetched! Total results: %d%s\n\n", Green+Bold, len(allResults), Reset)
 
 	// Step 3: Save summary JSON
 	combined := CombinedResults{
@@ -206,16 +258,17 @@ func main() {
 	summaryFile := fmt.Sprintf("results/summary_%s.json", timestamp)
 	err = saveToJSON(combined, summaryFile)
 	if err != nil {
-		fmt.Printf("Error saving summary file: %v\n", err)
+		fmt.Printf("%s[!] Error saving summary: %v%s\n", Yellow, err, Reset)
 	} else {
-		fmt.Printf("✓ Summary saved to %s\n", summaryFile)
+		fmt.Printf("%s[+] Summary saved to %s%s\n", Green, summaryFile, Reset)
 	}
 
-	fmt.Printf("\nAll files saved in results/ directory:\n")
-	fmt.Printf("  - fofa_domain_%s.txt (all domains)\n", timestamp)
-	fmt.Printf("  - fofa_json_%s.txt (raw JSON results)\n", timestamp)
-	fmt.Printf("  - fofa_results_%s.csv (CSV format)\n", timestamp)
-	fmt.Printf("  - summary_%s.json (complete summary)\n", timestamp)
+	fmt.Printf("\n%s%s%s\n", Cyan+Bold, strings.Repeat("═", 60), Reset)
+	fmt.Printf("%s[+] Scan selesai!%s\n", Green+Bold, Reset)
+	fmt.Printf("%s[+] Domains  : results/fofa_domain_%s.txt%s\n", Green, timestamp, Reset)
+	fmt.Printf("%s[+] CSV      : results/fofa_results_%s.csv%s\n", Green, timestamp, Reset)
+	fmt.Printf("%s[+] Summary  : results/summary_%s.json%s\n", Green, timestamp, Reset)
+	fmt.Printf("%s%s%s\n", Cyan+Bold, strings.Repeat("═", 60), Reset)
 }
 
 // loadConfig loads configuration from .env file
