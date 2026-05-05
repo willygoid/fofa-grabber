@@ -1,3 +1,4 @@
 #IGNORE FILE and FOLDERS
 .env
+.DS_Store
 results/
