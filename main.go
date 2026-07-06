@@ -83,7 +83,7 @@ func PrintBanner() {
 |  _  \ \/ / '__|   | |/ _ \ / _ \| / __|
 | | | |>  <| |      | | (_) | (_) | \__ \
 \_| |_/_/\_\_|      \_/\___/ \___/|_|___/
-		   FoFa API Grabber v1.1
+		   FoFa API Grabber v1.2
 		   by @willygoid
 `
 	fmt.Println(banner)
@@ -142,6 +142,23 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Get search method from user input
+	fmt.Println("\nSearch Method:")
+	fmt.Println("  1. Standard (default)")
+	fmt.Println("  2. Full")
+	fmt.Print("Choose method [1/2] (default 1): ")
+	scanner.Scan()
+	methodChoice := strings.TrimSpace(scanner.Text())
+
+	fullSearch := methodChoice == "2"
+	fullParam := ""
+	methodName := "Standard"
+	if fullSearch {
+		fullParam = "&full=true"
+		methodName = "Full"
+	}
+	fmt.Printf("%s[+] Search method: %s%s\n", Green, methodName, Reset)
+
 	// Convert query to base64
 	queryBase64 := encodeBase64(query)
 	fmt.Printf("\nQuery (Base64): %s\n", queryBase64)
@@ -163,8 +180,8 @@ func main() {
 
 	// Step 1: Get first page to determine total size
 	fmt.Println("Fetching first page to determine total size...")
-	firstPageURL := fmt.Sprintf("https://fofa.info/api/v1/search/all?key=%s&page=1&qbase64=%s",
-		config.APIKey, queryBase64)
+	firstPageURL := fmt.Sprintf("https://fofa.info/api/v1/search/all?key=%s&page=1&qbase64=%s%s",
+		config.APIKey, queryBase64, fullParam)
 
 	firstPage, err := fetchFofaData(firstPageURL, delayBetweenRequests)
 	if err != nil {
@@ -201,8 +218,8 @@ func main() {
 
 	const maxRetries = 3
 	for page := 1; page <= totalPages; page++ {
-		apiURL := fmt.Sprintf("https://fofa.info/api/v1/search/all?key=%s&page=%d&qbase64=%s",
-			config.APIKey, page, queryBase64)
+		apiURL := fmt.Sprintf("https://fofa.info/api/v1/search/all?key=%s&page=%d&qbase64=%s%s",
+			config.APIKey, page, queryBase64, fullParam)
 
 		var data *FofaResponse
 		var fetchErr error
