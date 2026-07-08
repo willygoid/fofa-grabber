@@ -1,4 +1,5 @@
 #IGNORE FILE and FOLDERS
 .env
 .DS_Store
+.fofa_session.json
 results/

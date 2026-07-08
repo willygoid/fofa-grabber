@@ -83,7 +83,7 @@ func PrintBanner() {
 |  _  \ \/ / '__|   | |/ _ \ / _ \| / __|
 | | | |>  <| |      | | (_) | (_) | \__ \
 \_| |_/_/\_\_|      \_/\___/ \___/|_|___/
-		   FoFa API Grabber v1.2
+		   FoFa API Grabber v1.3
 		   by @willygoid
 `
 	fmt.Println(banner)
@@ -119,6 +119,24 @@ type Config struct {
 	ConcurrentRequests int
 }
 
+// sessionFile stores progress so an interrupted scan (crash/power loss) can be resumed
+const sessionFile = ".fofa_session.json"
+
+// SessionState persists the last query and the last completed page
+type SessionState struct {
+	Query       string `json:"query"`
+	Method      string `json:"method"`
+	FullSearch  bool   `json:"full_search"`
+	LastPage    int    `json:"last_page"`
+	TotalPages  int    `json:"total_pages"`
+	TotalSize   int    `json:"total_size"`
+	FailedPages []int  `json:"failed_pages"`
+	DomainFile  string `json:"domain_file"`
+	CSVFile     string `json:"csv_file"`
+	Timestamp   string `json:"timestamp"`
+	UpdatedAt   string `json:"updated_at"`
+}
+
 func main() {
 	PrintBanner()
 	// Load configuration from .env file
@@ -131,37 +149,38 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Get query from user input
-	fmt.Print("Input Query: ")
+	// Load previous session state (for resume after crash/power loss)
+	prevSession, _ := loadSessionState(sessionFile)
+	if prevSession != nil {
+		fmt.Printf("\n%s[i] Previous session found:%s\n", Cyan+Bold, Reset)
+		fmt.Printf("    Query    : %s\n", prevSession.Query)
+		fmt.Printf("    Method   : %s\n", prevSession.Method)
+		fmt.Printf("    Progress : page %d / %d\n", prevSession.LastPage, prevSession.TotalPages)
+		if len(prevSession.FailedPages) > 0 {
+			fmt.Printf("%s    Failed   : %v%s\n", Yellow, prevSession.FailedPages, Reset)
+		}
+		fmt.Printf("    Updated  : %s\n", prevSession.UpdatedAt)
+		if prevSession.LastPage < prevSession.TotalPages {
+			fmt.Printf("%s    -> You can resume from page %d%s\n", Yellow, prevSession.LastPage+1, Reset)
+		} else {
+			fmt.Printf("%s    -> This session appears complete%s\n", Green, Reset)
+		}
+	}
+
 	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Scan()
-	query := strings.TrimSpace(scanner.Text())
 
-	if query == "" {
-		fmt.Println("Error: Query cannot be empty")
-		os.Exit(1)
+	// Offer a retry-only mode when the previous session left failed pages
+	retryOnly := false
+	if prevSession != nil && len(prevSession.FailedPages) > 0 {
+		fmt.Printf("\n%s[?] Retry ONLY the %d failed page(s) %v from the previous session? [y/N]: %s",
+			Cyan+Bold, len(prevSession.FailedPages), prevSession.FailedPages, Reset)
+		scanner.Scan()
+		ans := strings.ToLower(strings.TrimSpace(scanner.Text()))
+		retryOnly = ans == "y" || ans == "yes"
+		if retryOnly {
+			fmt.Printf("%s[+] Retry-only mode selected%s\n", Green, Reset)
+		}
 	}
-
-	// Get search method from user input
-	fmt.Println("\nSearch Method:")
-	fmt.Println("  1. Standard (default)")
-	fmt.Println("  2. Full")
-	fmt.Print("Choose method [1/2] (default 1): ")
-	scanner.Scan()
-	methodChoice := strings.TrimSpace(scanner.Text())
-
-	fullSearch := methodChoice == "2"
-	fullParam := ""
-	methodName := "Standard"
-	if fullSearch {
-		fullParam = "&full=true"
-		methodName = "Full"
-	}
-	fmt.Printf("%s[+] Search method: %s%s\n", Green, methodName, Reset)
-
-	// Convert query to base64
-	queryBase64 := encodeBase64(query)
-	fmt.Printf("\nQuery (Base64): %s\n", queryBase64)
 
 	delayBetweenRequests := time.Duration(config.DelaySeconds) * time.Second
 
@@ -171,102 +190,251 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Generate timestamp for this run
-	timestamp := time.Now().Format("20060102_150405")
+	var query, methodName, fullParam, queryBase64, firstPageQuery string
+	var fullSearch bool
+	var startPage, totalSize, totalPages int
 
-	fmt.Printf("\nConfiguration loaded:\n")
-	fmt.Printf("- Delay: %v\n", delayBetweenRequests)
-	fmt.Printf("- Results will be saved to: results/\n\n")
+	if retryOnly {
+		// Reuse everything from the previous session — no new prompts, no size probe
+		query = prevSession.Query
+		fullSearch = prevSession.FullSearch
+		methodName = prevSession.Method
+		if fullSearch {
+			fullParam = "&full=true"
+		}
+		queryBase64 = encodeBase64(query)
+		totalSize = prevSession.TotalSize
+		totalPages = prevSession.TotalPages
+		firstPageQuery = query
+		fmt.Printf("%s[+] Retry-only: query \"%s\" (%s) — %d page(s): %v%s\n\n",
+			Green, query, methodName, len(prevSession.FailedPages), prevSession.FailedPages, Reset)
+	} else {
+		// Get query from user input (press enter to reuse the last query)
+		if prevSession != nil {
+			fmt.Printf("\nInput Query %s(enter to reuse: %s)%s: ", Yellow, prevSession.Query, Reset)
+		} else {
+			fmt.Print("\nInput Query: ")
+		}
+		scanner.Scan()
+		query = strings.TrimSpace(scanner.Text())
+		if query == "" && prevSession != nil {
+			query = prevSession.Query
+			fmt.Printf("%s[+] Reusing previous query%s\n", Green, Reset)
+		}
+		if query == "" {
+			fmt.Println("Error: Query cannot be empty")
+			os.Exit(1)
+		}
 
-	// Step 1: Get first page to determine total size
-	fmt.Println("Fetching first page to determine total size...")
-	firstPageURL := fmt.Sprintf("https://fofa.info/api/v1/search/all?key=%s&page=1&qbase64=%s%s",
-		config.APIKey, queryBase64, fullParam)
+		// Get search method from user input
+		fmt.Println("\nSearch Method:")
+		fmt.Println("  1. Standard (default)")
+		fmt.Println("  2. Full")
+		fmt.Print("Choose method [1/2] (default 1): ")
+		scanner.Scan()
+		methodChoice := strings.TrimSpace(scanner.Text())
+		fullSearch = methodChoice == "2"
+		methodName = "Standard"
+		if fullSearch {
+			fullParam = "&full=true"
+			methodName = "Full"
+		}
+		fmt.Printf("%s[+] Search method: %s%s\n", Green, methodName, Reset)
 
-	firstPage, err := fetchFofaData(firstPageURL, delayBetweenRequests)
-	if err != nil {
-		fmt.Printf("Error fetching first page: %v\n", err)
-		os.Exit(1)
+		// Get start page (default 1) — allows resuming a previous/interrupted search
+		suggestPage := 1
+		if prevSession != nil && prevSession.Query == query && prevSession.FullSearch == fullSearch &&
+			prevSession.LastPage < prevSession.TotalPages {
+			suggestPage = prevSession.LastPage + 1
+		}
+		if suggestPage > 1 {
+			fmt.Printf("\nStart page %s(default %d to resume previous search)%s: ", Yellow, suggestPage, Reset)
+		} else {
+			fmt.Print("\nStart page (default 1): ")
+		}
+		scanner.Scan()
+		startPageInput := strings.TrimSpace(scanner.Text())
+		startPage = suggestPage
+		if startPageInput != "" {
+			if val, err := strconv.Atoi(startPageInput); err == nil && val >= 1 {
+				startPage = val
+			} else {
+				fmt.Printf("%s[!] Invalid start page, using %d%s\n", Yellow, startPage, Reset)
+			}
+		}
+		fmt.Printf("%s[+] Starting from page: %d%s\n", Green, startPage, Reset)
+
+		queryBase64 = encodeBase64(query)
+		fmt.Printf("\nQuery (Base64): %s\n", queryBase64)
+
+		fmt.Printf("\nConfiguration loaded:\n")
+		fmt.Printf("- Delay: %v\n", delayBetweenRequests)
+		fmt.Printf("- Results will be saved to: results/\n\n")
+
+		// Probe the start page to determine total size
+		fmt.Printf("Fetching page %d to determine total size...\n", startPage)
+		firstPageURL := fmt.Sprintf("https://fofa.info/api/v1/search/all?key=%s&page=%d&qbase64=%s%s",
+			config.APIKey, startPage, queryBase64, fullParam)
+		firstPage, ferr := fetchFofaData(firstPageURL, delayBetweenRequests)
+		if ferr != nil {
+			fmt.Printf("Error fetching first page: %v\n", ferr)
+			os.Exit(1)
+		}
+		totalSize = firstPage.Size
+		totalPages = int(math.Ceil(float64(totalSize) / 100.0))
+		firstPageQuery = firstPage.Query
+
+		fmt.Printf("Total size: %d\n", totalSize)
+		fmt.Printf("Total pages to fetch: %d\n", totalPages)
+		fmt.Printf("Query: %s\n\n", firstPageQuery)
+
+		if startPage > totalPages {
+			fmt.Printf("%s[!] Start page %d is beyond the total of %d pages. Nothing to fetch.%s\n",
+				Red, startPage, totalPages, Reset)
+			os.Exit(1)
+		}
 	}
-
-	// Calculate total pages needed
-	totalSize := firstPage.Size
-	totalPages := int(math.Ceil(float64(totalSize) / 100.0))
-
-	fmt.Printf("Total size: %d\n", totalSize)
-	fmt.Printf("Total pages to fetch: %d\n", totalPages)
-	fmt.Printf("Query: %s\n\n", firstPage.Query)
 
 	// Step 2: Fetch all pages sequentially — FOFA requires ordered pagination (error 820013)
 	allResults := make([][]string, 0)
 
-	// File paths for real-time saving
-	domainFile := fmt.Sprintf("results/fofa_domain_%s.txt", timestamp)
-	csvFile := fmt.Sprintf("results/fofa_results_%s.csv", timestamp)
+	// Determine output files — reuse the previous session's files when resuming/retrying
+	var timestamp, domainFile, csvFile string
+	reuseFiles := prevSession != nil &&
+		(retryOnly ||
+			(prevSession.Query == query && prevSession.FullSearch == fullSearch && startPage > 1)) &&
+		fileExists(prevSession.DomainFile) &&
+		fileExists(prevSession.CSVFile)
 
-	// Create CSV file with header
-	if err := createCSVWithHeader(csvFile); err != nil {
-		fmt.Printf("Error creating CSV file: %v\n", err)
-		os.Exit(1)
+	if reuseFiles {
+		timestamp = prevSession.Timestamp
+		domainFile = prevSession.DomainFile
+		csvFile = prevSession.CSVFile
+		fmt.Printf("%s[+] Appending to existing files%s\n", Green, Reset)
+	} else {
+		timestamp = time.Now().Format("20060102_150405")
+		domainFile = fmt.Sprintf("results/fofa_domain_%s.txt", timestamp)
+		csvFile = fmt.Sprintf("results/fofa_results_%s.csv", timestamp)
+		if err := createCSVWithHeader(csvFile); err != nil {
+			fmt.Printf("Error creating CSV file: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
-	fmt.Printf("Starting to fetch %d pages sequentially with %v delay...\n\n",
-		totalPages, delayBetweenRequests)
+	// Build the list of pages to fetch
+	var pagesToFetch []int
+	if retryOnly {
+		pagesToFetch = append(pagesToFetch, prevSession.FailedPages...)
+	} else {
+		for p := startPage; p <= totalPages; p++ {
+			pagesToFetch = append(pagesToFetch, p)
+		}
+	}
 
-	bar := newStickyBar(totalPages, totalSize)
+	// Track the last successful page and any pages that failed, so nothing is lost
+	lastSuccessPage := startPage - 1
+	failedPages := make([]int, 0)
+	if retryOnly {
+		lastSuccessPage = prevSession.LastPage
+	} else if reuseFiles {
+		// Carry over earlier failed pages (before the resume point) so they get retried too
+		for _, p := range prevSession.FailedPages {
+			if p < startPage {
+				failedPages = append(failedPages, p)
+			}
+		}
+		if prevSession.LastPage > lastSuccessPage {
+			lastSuccessPage = prevSession.LastPage
+		}
+	}
+
+	// persist writes the current progress (last successful page + failed pages) to disk
+	persist := func() {
+		saveSessionState(sessionFile, &SessionState{
+			Query:       query,
+			Method:      methodName,
+			FullSearch:  fullSearch,
+			LastPage:    lastSuccessPage,
+			TotalPages:  totalPages,
+			TotalSize:   totalSize,
+			FailedPages: failedPages,
+			DomainFile:  domainFile,
+			CSVFile:     csvFile,
+			Timestamp:   timestamp,
+			UpdatedAt:   time.Now().Format("2006-01-02 15:04:05"),
+		})
+	}
+
+	if retryOnly {
+		fmt.Printf("Retrying %d failed page(s): %v with %v delay...\n\n",
+			len(pagesToFetch), pagesToFetch, delayBetweenRequests)
+	} else {
+		fmt.Printf("Starting to fetch pages %d-%d sequentially with %v delay...\n\n",
+			startPage, totalPages, delayBetweenRequests)
+	}
+
+	var bar *StickyBar
+	if retryOnly {
+		bar = newStickyBar(len(pagesToFetch), totalSize)
+	} else {
+		bar = newStickyBar(totalPages, totalSize)
+		bar.current = startPage - 1
+	}
 	bar.Init()
 
 	const maxRetries = 3
-	for page := 1; page <= totalPages; page++ {
-		apiURL := fmt.Sprintf("https://fofa.info/api/v1/search/all?key=%s&page=%d&qbase64=%s%s",
-			config.APIKey, page, queryBase64, fullParam)
-
-		var data *FofaResponse
-		var fetchErr error
-		var attempts int
-		for attempt := 1; attempt <= maxRetries; attempt++ {
-			attempts = attempt
-			data, fetchErr = fetchFofaData(apiURL, delayBetweenRequests)
-			if fetchErr == nil {
-				break
-			}
-			if attempt < maxRetries {
-				time.Sleep(delayBetweenRequests * 2)
-			}
-		}
-		if fetchErr != nil {
-			bar.Increment(fmt.Sprintf("%s❌ Page %d skipped after %d attempts: %v%s",
-				Red, page, maxRetries, fetchErr, Reset))
+	for _, page := range pagesToFetch {
+		results, ok := fetchPageWithRetries(config, page, totalPages, queryBase64, fullParam,
+			delayBetweenRequests, maxRetries, domainFile, csvFile, bar)
+		if !ok {
+			failedPages = append(failedPages, page)
+			persist()
 			continue
 		}
-
-		if err := appendDomains(data.Results, domainFile); err != nil {
-			bar.Increment(fmt.Sprintf("%s⚠ Page %d: failed to save domains: %v%s",
-				Yellow, page, err, Reset))
+		allResults = append(allResults, results...)
+		if page > lastSuccessPage {
+			lastSuccessPage = page
 		}
-		if err := appendToCSV(data.Results, csvFile); err != nil {
-			bar.Increment(fmt.Sprintf("%s⚠ Page %d: failed to save CSV: %v%s",
-				Yellow, page, err, Reset))
-		}
-
-		allResults = append(allResults, data.Results...)
-		retryNote := ""
-		if attempts > 1 {
-			retryNote = fmt.Sprintf(" (retry x%d)", attempts-1)
-		}
-		bar.Increment(fmt.Sprintf("%s✓ Page %d/%d — %d results%s%s",
-			Green, page, totalPages, len(data.Results), retryNote, Reset))
+		persist()
 	}
 
 	bar.Finish()
 
-	fmt.Printf("\n%s✓ All pages fetched! Total results: %d%s\n\n", Green+Bold, len(allResults), Reset)
+	// Automatic retry pass over pages that failed during a normal sweep
+	// (skipped in retry-only mode — the sweep above already was the retry)
+	if !retryOnly && len(failedPages) > 0 {
+		fmt.Printf("\n%s[*] Retrying %d failed page(s): %v%s\n\n",
+			Cyan+Bold, len(failedPages), failedPages, Reset)
+		toRetry := failedPages
+		failedPages = make([]int, 0)
+		retryBar := newStickyBar(len(toRetry), totalSize)
+		retryBar.Init()
+		for _, page := range toRetry {
+			results, ok := fetchPageWithRetries(config, page, totalPages, queryBase64, fullParam,
+				delayBetweenRequests, maxRetries, domainFile, csvFile, retryBar)
+			if !ok {
+				failedPages = append(failedPages, page)
+				persist()
+				continue
+			}
+			allResults = append(allResults, results...)
+			persist()
+		}
+		retryBar.Finish()
+	}
+
+	fmt.Printf("\n%s✓ All pages fetched! Total results: %d%s\n", Green+Bold, len(allResults), Reset)
+	if len(failedPages) > 0 {
+		fmt.Printf("%s[!] %d page(s) still failed: %v — rerun and resume to retry them%s\n",
+			Yellow, len(failedPages), failedPages, Reset)
+	}
+	fmt.Println()
 
 	// Step 3: Save summary JSON
 	combined := CombinedResults{
 		TotalSize:    totalSize,
 		TotalPages:   totalPages,
-		Query:        firstPage.Query,
+		Query:        firstPageQuery,
 		FetchedAt:    time.Now().Format("2006-01-02 15:04:05"),
 		AllResults:   allResults,
 		ResultsCount: len(allResults),
@@ -286,6 +454,82 @@ func main() {
 	fmt.Printf("%s[+] CSV      : results/fofa_results_%s.csv%s\n", Green, timestamp, Reset)
 	fmt.Printf("%s[+] Summary  : results/summary_%s.json%s\n", Green, timestamp, Reset)
 	fmt.Printf("%s%s%s\n", Cyan+Bold, strings.Repeat("═", 60), Reset)
+}
+
+// fetchPageWithRetries fetches a single page (with retries) and saves its results
+// to the domain/CSV files in real time. Returns the results and whether it succeeded.
+func fetchPageWithRetries(config *Config, page, totalPages int, queryBase64, fullParam string,
+	delay time.Duration, maxRetries int, domainFile, csvFile string, bar *StickyBar) ([][]string, bool) {
+
+	apiURL := fmt.Sprintf("https://fofa.info/api/v1/search/all?key=%s&page=%d&qbase64=%s%s",
+		config.APIKey, page, queryBase64, fullParam)
+
+	var data *FofaResponse
+	var fetchErr error
+	var attempts int
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		attempts = attempt
+		data, fetchErr = fetchFofaData(apiURL, delay)
+		if fetchErr == nil {
+			break
+		}
+		if attempt < maxRetries {
+			time.Sleep(delay * 2)
+		}
+	}
+	if fetchErr != nil {
+		bar.Increment(fmt.Sprintf("%s❌ Page %d skipped after %d attempts: %v%s",
+			Red, page, maxRetries, fetchErr, Reset))
+		return nil, false
+	}
+
+	if err := appendDomains(data.Results, domainFile); err != nil {
+		bar.Increment(fmt.Sprintf("%s⚠ Page %d: failed to save domains: %v%s",
+			Yellow, page, err, Reset))
+	}
+	if err := appendToCSV(data.Results, csvFile); err != nil {
+		bar.Increment(fmt.Sprintf("%s⚠ Page %d: failed to save CSV: %v%s",
+			Yellow, page, err, Reset))
+	}
+
+	retryNote := ""
+	if attempts > 1 {
+		retryNote = fmt.Sprintf(" (retry x%d)", attempts-1)
+	}
+	bar.Increment(fmt.Sprintf("%s✓ Page %d/%d — %d results%s%s",
+		Green, page, totalPages, len(data.Results), retryNote, Reset))
+	return data.Results, true
+}
+
+// loadSessionState reads the persisted session state, if any
+func loadSessionState(filename string) (*SessionState, error) {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, err
+	}
+	var s SessionState
+	if err := json.Unmarshal(data, &s); err != nil {
+		return nil, err
+	}
+	if s.Query == "" {
+		return nil, fmt.Errorf("empty session")
+	}
+	return &s, nil
+}
+
+// saveSessionState writes the current progress to disk (best-effort)
+func saveSessionState(filename string, s *SessionState) {
+	data, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(filename, data, 0644)
+}
+
+// fileExists reports whether a regular file exists at the given path
+func fileExists(filename string) bool {
+	info, err := os.Stat(filename)
+	return err == nil && !info.IsDir()
 }
 
 // loadConfig loads configuration from .env file
