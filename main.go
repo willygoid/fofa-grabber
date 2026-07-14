@@ -46,7 +46,7 @@ func (b *StickyBar) render() {
 		filled = int(float64(b.barWidth) * float64(b.current) / float64(b.total))
 	}
 	bar := strings.Repeat("█", filled) + strings.Repeat("░", b.barWidth-filled)
-	fmt.Printf("\r\033[K%s FoFa API Grabber v1.1 by @willygoid | Total Size: %d %s\n",
+	fmt.Printf("\r\033[K%s FoFa API Grabber v1.3.1 by @willygoid | Total Size: %d %s\n",
 		Cyan+Bold, b.size, Reset)
 	fmt.Printf("\r\033[K%s[%s] %d/%d (%.0f%%)%s",
 		White+Bold, bar, b.current, b.total, pct, Reset)
@@ -115,6 +115,7 @@ type CombinedResults struct {
 // Config holds environment configuration
 type Config struct {
 	APIKey             string
+	APIBase            string
 	DelaySeconds       int
 	ConcurrentRequests int
 }
@@ -277,8 +278,8 @@ func main() {
 
 		// Probe the start page to determine total size
 		fmt.Printf("Fetching page %d to determine total size...\n", startPage)
-		firstPageURL := fmt.Sprintf("https://fofa.info/api/v1/search/all?key=%s&page=%d&qbase64=%s%s",
-			config.APIKey, startPage, queryBase64, fullParam)
+		firstPageURL := fmt.Sprintf("%s/api/v1/search/all?key=%s&page=%d&qbase64=%s%s",
+			config.APIBase, config.APIKey, startPage, queryBase64, fullParam)
 		firstPage, ferr := fetchFofaData(firstPageURL, delayBetweenRequests)
 		if ferr != nil {
 			fmt.Printf("%sError fetching first page: %v%s\n", Red, ferr, Reset)
@@ -473,8 +474,8 @@ func main() {
 func fetchPageWithRetries(config *Config, page, totalPages int, queryBase64, fullParam string,
 	delay time.Duration, maxRetries int, domainFile, csvFile string, bar *StickyBar) ([][]string, bool) {
 
-	apiURL := fmt.Sprintf("https://fofa.info/api/v1/search/all?key=%s&page=%d&qbase64=%s%s",
-		config.APIKey, page, queryBase64, fullParam)
+	apiURL := fmt.Sprintf("%s/api/v1/search/all?key=%s&page=%d&qbase64=%s%s",
+		config.APIBase, config.APIKey, page, queryBase64, fullParam)
 
 	var data *FofaResponse
 	var fetchErr error
@@ -553,6 +554,7 @@ func loadConfig(filename string) (*Config, error) {
 	defer file.Close()
 
 	config := &Config{
+		APIBase:            "https://en.fofa.info",
 		DelaySeconds:       2,
 		ConcurrentRequests: 3,
 	}
@@ -578,6 +580,8 @@ func loadConfig(filename string) (*Config, error) {
 		switch key {
 		case "FOFA_API_KEY":
 			config.APIKey = value
+		case "FOFA_API_BASE":
+			config.APIBase = value
 		case "DELAY_SECONDS":
 			if val, err := strconv.Atoi(value); err == nil {
 				config.DelaySeconds = val
@@ -603,6 +607,10 @@ func createDefaultEnv() {
 
 FOFA_API_KEY=your_api_key_here
 
+# FOFA API Base URL (default: en.fofa.info)
+# You can change to: fofa.info (CN), en.fofa.info (EN), etc.
+FOFA_API_BASE=https://en.fofa.info
+
 # Request configuration
 DELAY_SECONDS=5
 CONCURRENT_REQUESTS=1
@@ -613,11 +621,11 @@ CONCURRENT_REQUESTS=1
 
 // fetchFofaData fetches data from FOFA API with browser-like headers
 func fetchFofaData(url string, delay time.Duration) (*FofaResponse, error) {
-	// Random delay untuk lebih natural
+	// Apply delay before request
 	time.Sleep(delay)
 
 	client := &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: 120 * time.Second,
 	}
 
 	// Create request
@@ -650,7 +658,8 @@ func fetchFofaData(url string, delay time.Duration) (*FofaResponse, error) {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API returned status code: %d", resp.StatusCode)
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API returned status code %d. Response: %s", resp.StatusCode, string(bodyBytes))
 	}
 
 	// Handle gzip encoding
@@ -680,7 +689,16 @@ func fetchFofaData(url string, delay time.Duration) (*FofaResponse, error) {
 	}
 
 	if fofaResp.Error {
-		return nil, fmt.Errorf("API returned error: %s (tip: %s)", fofaResp.Tip, fofaResp.Tip)
+		tip := fofaResp.Tip
+		if tip == "" {
+			tip = "(no error message from API)"
+		}
+		// Show full response for debugging
+		respStr := string(body)
+		if len(respStr) > 300 {
+			respStr = respStr[:300] + "..."
+		}
+		return nil, fmt.Errorf("API returned error: %s\nFull response: %s", tip, respStr)
 	}
 
 	if fofaResp.Size < 0 {
