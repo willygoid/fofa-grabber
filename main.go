@@ -83,8 +83,8 @@ func PrintBanner() {
 |  _  \ \/ / '__|   | |/ _ \ / _ \| / __|
 | | | |>  <| |      | | (_) | (_) | \__ \
 \_| |_/_/\_\_|      \_/\___/ \___/|_|___/
-		   FoFa API Grabber v1.3
-		   by @willygoid
+		FoFa API Grabber v1.3.1
+		by @willygoid
 `
 	fmt.Println(banner)
 }
@@ -179,6 +179,10 @@ func main() {
 		retryOnly = ans == "y" || ans == "yes"
 		if retryOnly {
 			fmt.Printf("%s[+] Retry-only mode selected%s\n", Green, Reset)
+		} else {
+			// User declined retry-only: Clear session state for fresh start
+			prevSession = nil
+			os.Remove(sessionFile)
 		}
 	}
 
@@ -277,12 +281,20 @@ func main() {
 			config.APIKey, startPage, queryBase64, fullParam)
 		firstPage, ferr := fetchFofaData(firstPageURL, delayBetweenRequests)
 		if ferr != nil {
-			fmt.Printf("Error fetching first page: %v\n", ferr)
+			fmt.Printf("%sError fetching first page: %v%s\n", Red, ferr, Reset)
+			os.Exit(1)
+		}
+		if firstPage == nil {
+			fmt.Printf("%sError: Received nil response from API%s\n", Red, Reset)
 			os.Exit(1)
 		}
 		totalSize = firstPage.Size
 		totalPages = int(math.Ceil(float64(totalSize) / 100.0))
 		firstPageQuery = firstPage.Query
+		if totalPages == 0 {
+			fmt.Printf("%sError: API returned 0 total pages for query%s\n", Red, Reset)
+			os.Exit(1)
+		}
 
 		fmt.Printf("Total size: %d\n", totalSize)
 		fmt.Printf("Total pages to fetch: %d\n", totalPages)
@@ -660,11 +672,19 @@ func fetchFofaData(url string, delay time.Duration) (*FofaResponse, error) {
 	var fofaResp FofaResponse
 	err = json.Unmarshal(body, &fofaResp)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse JSON: %w (response: %s)", err, string(body[:min(200, len(body))]))
+		respPreview := string(body)
+		if len(respPreview) > 500 {
+			respPreview = respPreview[:500] + "..."
+		}
+		return nil, fmt.Errorf("failed to parse JSON response: %w\nResponse: %s", err, respPreview)
 	}
 
 	if fofaResp.Error {
-		return nil, fmt.Errorf("API returned error: %s", fofaResp.Tip)
+		return nil, fmt.Errorf("API returned error: %s (tip: %s)", fofaResp.Tip, fofaResp.Tip)
+	}
+
+	if fofaResp.Size < 0 {
+		return nil, fmt.Errorf("API returned invalid size: %d", fofaResp.Size)
 	}
 
 	return &fofaResp, nil
